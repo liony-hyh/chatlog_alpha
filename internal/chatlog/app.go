@@ -5,13 +5,15 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"github.com/sjzar/chatlog/internal/chatlog/ctx"
+	"github.com/sjzar/chatlog/internal/ui/dashboard"
 	"github.com/sjzar/chatlog/internal/ui/footer"
 	"github.com/sjzar/chatlog/internal/ui/form"
 	"github.com/sjzar/chatlog/internal/ui/help"
-	"github.com/sjzar/chatlog/internal/ui/infobar"
+	"github.com/sjzar/chatlog/internal/ui/layout"
+	"github.com/sjzar/chatlog/internal/ui/logs"
 	"github.com/sjzar/chatlog/internal/ui/menu"
+	"github.com/sjzar/chatlog/internal/ui/sidebar"
 	"github.com/sjzar/chatlog/internal/wechat"
 
 	"github.com/gdamore/tcell/v2"
@@ -29,59 +31,76 @@ type App struct {
 	m           *Manager
 	stopRefresh chan struct{}
 
-	// page
-	mainPages *tview.Pages
-	infoBar   *infobar.InfoBar
-	tabPages  *tview.Pages
+	// UI Components
+	layout    *layout.Layout
+	sidebar   *sidebar.Sidebar
+	dashboard *dashboard.Dashboard
+	logs      *logs.Logs
 	footer    *footer.Footer
 
-	// tab
-	menu      *menu.Menu
-	help      *help.Help
-	activeTab int
-	tabCount  int
+	// Page Managers
+	rootPages    *tview.Pages // Handles Main Layout + Modals
+	contentPages *tview.Pages // Handles Content (Dashboard, Actions, Settings, etc.)
+
+	// Specific Pages
+	actionsMenu *menu.Menu
+	help        *help.Help
 }
 
 func NewApp(ctx *ctx.Context, m *Manager) *App {
 	app := &App{
-		ctx:         ctx,
-		m:           m,
-		Application: tview.NewApplication(),
-		mainPages:   tview.NewPages(),
-		infoBar:     infobar.New(),
-		tabPages:    tview.NewPages(),
-		footer:      footer.New(),
-		menu:        menu.New("主菜单"),
-		help:        help.New(),
+		ctx:          ctx,
+		m:            m,
+		Application:  tview.NewApplication(),
+		rootPages:    tview.NewPages(),
+		contentPages: tview.NewPages(),
+		dashboard:    dashboard.New(),
+		logs:         logs.New(),
+		footer:       footer.New(),
+		actionsMenu:  menu.New("操作菜单"),
+		help:         help.New(),
 	}
 
-	app.initMenu()
+	// Initialize Sidebar
+	app.sidebar = sidebar.New(app.onSidebarSelected)
+	app.sidebar.AddItem("概览", '1')
+	app.sidebar.AddItem("操作", '2')
+	app.sidebar.AddItem("设置", '3')
+	app.sidebar.AddItem("日志", '4')
+	app.sidebar.AddItem("帮助", '5')
 
+	// Initialize Layout
+	app.layout = layout.New(app.sidebar, app.contentPages)
+
+	// Build the main view with Footer
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(app.layout, 0, 1, true).
+		AddItem(app.footer, 1, 1, false)
+
+	app.rootPages.AddPage("main", flex, true, true)
+
+	// Initialize Pages
+	app.contentPages.AddPage("概览", app.dashboard, true, true)
+	app.contentPages.AddPage("操作", app.actionsMenu, true, false)
+	app.contentPages.AddPage("日志", app.logs, true, false)
+	app.contentPages.AddPage("帮助", app.help, true, false)
+	
+	// Settings page will be dynamic (using form) but for now let's add a placeholder or the sub-menu logic
+	app.initSettingsPage()
+
+	app.initMenu()
 	app.updateMenuItemsState()
 
 	return app
 }
 
 func (a *App) Run() error {
-
-	flex := tview.NewFlex().
-		SetDirection(tview.FlexRow).
-		AddItem(a.infoBar, infobar.InfoBarViewHeight, 0, false).
-		AddItem(a.tabPages, 0, 1, true).
-		AddItem(a.footer, 1, 1, false)
-
-	a.mainPages.AddPage("main", flex, true, true)
-
-	a.tabPages.
-		AddPage("0", a.menu, true, true).
-		AddPage("1", a.help, true, false)
-	a.tabCount = 2
-
 	a.SetInputCapture(a.inputCapture)
 
 	go a.refresh()
 
-	if err := a.SetRoot(a.mainPages, true).EnableMouse(false).Run(); err != nil {
+	if err := a.SetRoot(a.rootPages, true).EnableMouse(true).Run(); err != nil {
 		return err
 	}
 
@@ -89,17 +108,70 @@ func (a *App) Run() error {
 }
 
 func (a *App) Stop() {
-	// 添加一个通道用于停止刷新 goroutine
 	if a.stopRefresh != nil {
 		close(a.stopRefresh)
 	}
 	a.Application.Stop()
 }
 
+func (a *App) onSidebarSelected(index int, mainText string, secondaryText string, shortcut rune) {
+	if a.contentPages.HasPage(mainText) {
+		a.contentPages.SwitchToPage(mainText)
+	}
+}
+
+func (a *App) initSettingsPage() {
+	// For settings, we can reuse the Menu structure as a list of settings categories
+	settingsMenu := menu.New("系统设置")
+	
+	settings := []settingItem{
+		{
+			name:        "设置 HTTP 服务地址",
+			description: "配置 HTTP 服务监听的地址",
+			action:      a.settingHTTPPort,
+		},
+		{
+			name:        "设置工作目录",
+			description: "配置数据解密后的存储目录",
+			action:      a.settingWorkDir,
+		},
+		{
+			name:        "设置数据密钥",
+			description: "配置数据解密密钥",
+			action:      a.settingDataKey,
+		},
+		{
+			name:        "设置图片密钥",
+			description: "配置图片解密密钥",
+			action:      a.settingImgKey,
+		},
+		{
+			name:        "设置数据目录",
+			description: "配置微信数据文件所在目录",
+			action:      a.settingDataDir,
+		},
+	}
+
+	for idx, setting := range settings {
+		item := &menu.Item{
+			Index:       idx + 1,
+			Name:        setting.name,
+			Description: setting.description,
+			Selected: func(action func()) func(*menu.Item) {
+				return func(*menu.Item) {
+					action()
+				}
+			}(setting.action),
+		}
+		settingsMenu.AddItem(item)
+	}
+	
+	a.contentPages.AddPage("设置", settingsMenu, true, false)
+}
+
 func (a *App) updateMenuItemsState() {
-	// 查找并更新自动解密菜单项
-	for _, item := range a.menu.GetItems() {
-		// 更新自动解密菜单项
+	for _, item := range a.actionsMenu.GetItems() {
+		// Auto Decrypt
 		if item.Index == 6 {
 			if a.ctx.AutoDecrypt {
 				item.Name = "停止自动解密"
@@ -110,7 +182,7 @@ func (a *App) updateMenuItemsState() {
 			}
 		}
 
-		// 更新HTTP服务菜单项
+		// HTTP Service
 		if item.Index == 5 {
 			if a.ctx.HTTPEnabled {
 				item.Name = "停止 HTTP 服务"
@@ -123,15 +195,6 @@ func (a *App) updateMenuItemsState() {
 	}
 }
 
-func (a *App) switchTab(step int) {
-	index := (a.activeTab + step) % a.tabCount
-	if index < 0 {
-		index = a.tabCount - 1
-	}
-	a.activeTab = index
-	a.tabPages.SwitchToPage(fmt.Sprint(a.activeTab))
-}
-
 func (a *App) refresh() {
 	tick := time.NewTicker(RefreshInterval)
 	defer tick.Stop()
@@ -141,18 +204,16 @@ func (a *App) refresh() {
 		case <-a.stopRefresh:
 			return
 		case <-tick.C:
-			// 如果当前账号为空，尝试查找微信进程
+			// Auto-detect account if nil
 			if a.ctx.Current == nil {
-				// 获取微信实例
 				instances := a.m.wechat.GetWeChatInstances()
 				if len(instances) > 0 {
-					// 找到微信进程，设置第一个为当前账号
 					a.ctx.SwitchCurrent(instances[0])
-					log.Info().Msgf("检测到微信进程，PID: %d，已设置为当前账号", instances[0].PID)
+					a.logs.AddLog(fmt.Sprintf("检测到微信进程，PID: %d，已设置为当前账号", instances[0].PID))
 				}
 			}
 
-			// 刷新当前账号状态（如果存在）
+			// Refresh account status
 			if a.ctx.Current != nil {
 				originalName := a.ctx.Current.Name
 				a.ctx.Current.RefreshStatus()
@@ -166,27 +227,36 @@ func (a *App) refresh() {
 			if a.ctx.AutoDecrypt || a.ctx.HTTPEnabled {
 				a.m.RefreshSession()
 			}
-			a.infoBar.UpdateAccount(a.ctx.Account)
-			a.infoBar.UpdateBasicInfo(a.ctx.PID, a.ctx.FullVersion, a.ctx.ExePath)
-			a.infoBar.UpdateStatus(a.ctx.Status)
-			a.infoBar.UpdateDataKey(a.ctx.DataKey)
-			a.infoBar.UpdateImageKey(a.ctx.ImgKey)
-			a.infoBar.UpdatePlatform(a.ctx.Platform)
-			a.infoBar.UpdateDataUsageDir(a.ctx.DataUsage, a.ctx.DataDir)
-			a.infoBar.UpdateWorkUsageDir(a.ctx.WorkUsage, a.ctx.WorkDir)
+
+			// Update Dashboard
+			dashboardData := map[string]string{
+				"Account":      a.ctx.Account,
+				"PID":          fmt.Sprintf("%d", a.ctx.PID),
+				"Status":       a.ctx.Status,
+				"ExePath":      a.ctx.ExePath,
+				"Platform":     a.ctx.Platform,
+				"Version":      a.ctx.FullVersion,
+				"Session":      "",
+				"Data Key":     a.ctx.DataKey,
+				"Image Key":    a.ctx.ImgKey,
+				"Data Usage":   a.ctx.DataUsage,
+				"Data Dir":     a.ctx.DataDir,
+				"Work Usage":   a.ctx.WorkUsage,
+				"Work Dir":     a.ctx.WorkDir,
+				"HTTP Server":  "[未启动]",
+				"Auto Decrypt": "[未开启]",
+			}
+
 			if a.ctx.LastSession.Unix() > 1000000000 {
-				a.infoBar.UpdateSession(a.ctx.LastSession.Format("2006-01-02 15:04:05"))
+				dashboardData["Session"] = a.ctx.LastSession.Format("2006-01-02 15:04:05")
 			}
 			if a.ctx.HTTPEnabled {
-				a.infoBar.UpdateHTTPServer(fmt.Sprintf("[green][已启动][white] [%s]", a.ctx.HTTPAddr))
-			} else {
-				a.infoBar.UpdateHTTPServer("[未启动]")
+				dashboardData["HTTP Server"] = fmt.Sprintf("[green][已启动][white] [%s]", a.ctx.HTTPAddr)
 			}
 			if a.ctx.AutoDecrypt {
-				a.infoBar.UpdateAutoDecrypt("[green][已开启][white]")
-			} else {
-				a.infoBar.UpdateAutoDecrypt("[未开启]")
+				dashboardData["Auto Decrypt"] = "[green][已开启][white]"
 			}
+			a.dashboard.Update(dashboardData)
 
 			// Update latest message in footer
 			if session, err := a.m.GetLatestSession(); err == nil && session != nil {
@@ -203,28 +273,26 @@ func (a *App) refresh() {
 }
 
 func (a *App) inputCapture(event *tcell.EventKey) *tcell.EventKey {
-
-	// 如果当前页面不是主页面，ESC 键返回主页面
-	if a.mainPages.HasPage("submenu") && event.Key() == tcell.KeyEscape {
-		a.mainPages.RemovePage("submenu")
-		a.mainPages.SwitchToPage("main")
-		return nil
-	}
-
-	if a.tabPages.HasFocus() {
-		switch event.Key() {
-		case tcell.KeyLeft:
-			a.switchTab(-1)
-			return nil
-		case tcell.KeyRight:
-			a.switchTab(1)
-			return nil
-		}
+	// If a modal is open (like settings form), let it handle input
+	// Simple check: if rootPages front page is not "main"
+	name, _ := a.rootPages.GetFrontPage()
+	if name != "main" {
+		return event
 	}
 
 	switch event.Key() {
 	case tcell.KeyCtrlC:
 		a.Stop()
+	case tcell.KeyTab:
+		// Switch focus between sidebar and content
+		if a.sidebar.HasFocus() {
+			_, item := a.contentPages.GetFrontPage()
+			if item != nil {
+				a.SetFocus(item)
+			}
+		} else {
+			a.SetFocus(a.sidebar)
+		}
 	}
 
 	return event
@@ -236,28 +304,27 @@ func (a *App) initMenu() {
 		Name:        "获取图片密钥",
 		Description: "扫描内存获取图片密钥(需微信V4)",
 		Selected: func(i *menu.Item) {
+			a.logs.AddLog("开始扫描内存获取图片密钥...")
 			modal := tview.NewModal()
 			modal.SetText("正在扫描内存获取图片密钥...\n请确保微信已登录并浏览过图片")
-			a.mainPages.AddPage("modal", modal, true, true)
+			a.rootPages.AddPage("modal", modal, true, true)
 			a.SetFocus(modal)
 
 			go func() {
 				err := a.m.GetImageKey()
 
-				// 在主线程中更新UI
 				a.QueueUpdateDraw(func() {
 					if err != nil {
-						// 解密失败
+						a.logs.AddLog("获取图片密钥失败: " + err.Error())
 						modal.SetText("获取图片密钥失败: " + err.Error())
 					} else {
-						// 解密成功
+						a.logs.AddLog("获取图片密钥成功")
 						modal.SetText("获取图片密钥成功")
 					}
 
-					// 添加确认按钮
 					modal.AddButtons([]string{"OK"})
 					modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						a.mainPages.RemovePage("modal")
+						a.rootPages.RemovePage("modal")
 					})
 					a.SetFocus(modal)
 				})
@@ -270,15 +337,16 @@ func (a *App) initMenu() {
 		Name:        "重启并获取密钥",
 		Description: "结束当前微信进程，重启后获取密钥",
 		Selected: func(i *menu.Item) {
+			a.logs.AddLog("准备重启微信获取密钥...")
 			modal := tview.NewModal().SetText("正在准备重启微信...")
-			a.mainPages.AddPage("modal", modal, true, true)
+			a.rootPages.AddPage("modal", modal, true, true)
 			a.SetFocus(modal)
 
 			go func() {
-				// 定义状态更新回调
 				onStatus := func(msg string) {
 					a.QueueUpdateDraw(func() {
 						modal.SetText(msg)
+						a.logs.AddLog(msg)
 					})
 				}
 
@@ -286,14 +354,16 @@ func (a *App) initMenu() {
 
 				a.QueueUpdateDraw(func() {
 					if err != nil {
+						a.logs.AddLog("重启获取密钥失败: " + err.Error())
 						modal.SetText("操作失败: " + err.Error())
 					} else {
+						a.logs.AddLog("重启获取密钥成功")
 						modal.SetText("操作成功，请检查密钥是否已更新")
 					}
 
 					modal.AddButtons([]string{"OK"})
 					modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						a.mainPages.RemovePage("modal")
+						a.rootPages.RemovePage("modal")
 					})
 					a.SetFocus(modal)
 				})
@@ -306,32 +376,26 @@ func (a *App) initMenu() {
 		Name:        "解密数据",
 		Description: "解密数据文件",
 		Selected: func(i *menu.Item) {
-			// 创建一个没有按钮的模态框，显示"解密中..."
-			modal := tview.NewModal().
-				SetText("解密中...")
-
-			a.mainPages.AddPage("modal", modal, true, true)
+			a.logs.AddLog("开始解密数据...")
+			modal := tview.NewModal().SetText("解密中...")
+			a.rootPages.AddPage("modal", modal, true, true)
 			a.SetFocus(modal)
 
-			// 在后台执行解密操作
 			go func() {
-				// 执行解密
 				err := a.m.DecryptDBFiles()
 
-				// 在主线程中更新UI
 				a.QueueUpdateDraw(func() {
 					if err != nil {
-						// 解密失败
+						a.logs.AddLog("解密失败: " + err.Error())
 						modal.SetText("解密失败: " + err.Error())
 					} else {
-						// 解密成功
+						a.logs.AddLog("解密数据成功")
 						modal.SetText("解密数据成功")
 					}
 
-					// 添加确认按钮
 					modal.AddButtons([]string{"OK"})
 					modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						a.mainPages.RemovePage("modal")
+						a.rootPages.RemovePage("modal")
 					})
 					a.SetFocus(modal)
 				})
@@ -346,65 +410,56 @@ func (a *App) initMenu() {
 		Selected: func(i *menu.Item) {
 			modal := tview.NewModal()
 
-			// 根据当前服务状态执行不同操作
 			if !a.ctx.HTTPEnabled {
-				// HTTP 服务未启动，启动服务
+				a.logs.AddLog("正在启动 HTTP 服务...")
 				modal.SetText("正在启动 HTTP 服务...")
-				a.mainPages.AddPage("modal", modal, true, true)
+				a.rootPages.AddPage("modal", modal, true, true)
 				a.SetFocus(modal)
 
-				// 在后台启动服务
 				go func() {
 					err := a.m.StartService()
 
-					// 在主线程中更新UI
 					a.QueueUpdateDraw(func() {
 						if err != nil {
-							// 启动失败
+							a.logs.AddLog("启动 HTTP 服务失败: " + err.Error())
 							modal.SetText("启动 HTTP 服务失败: " + err.Error())
 						} else {
-							// 启动成功
+							a.logs.AddLog("已启动 HTTP 服务")
 							modal.SetText("已启动 HTTP 服务")
 						}
 
-						// 更改菜单项名称
 						a.updateMenuItemsState()
 
-						// 添加确认按钮
 						modal.AddButtons([]string{"OK"})
 						modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-							a.mainPages.RemovePage("modal")
+							a.rootPages.RemovePage("modal")
 						})
 						a.SetFocus(modal)
 					})
 				}()
 			} else {
-				// HTTP 服务已启动，停止服务
+				a.logs.AddLog("正在停止 HTTP 服务...")
 				modal.SetText("正在停止 HTTP 服务...")
-				a.mainPages.AddPage("modal", modal, true, true)
+				a.rootPages.AddPage("modal", modal, true, true)
 				a.SetFocus(modal)
 
-				// 在后台停止服务
 				go func() {
 					err := a.m.StopService()
 
-					// 在主线程中更新UI
 					a.QueueUpdateDraw(func() {
 						if err != nil {
-							// 停止失败
+							a.logs.AddLog("停止 HTTP 服务失败: " + err.Error())
 							modal.SetText("停止 HTTP 服务失败: " + err.Error())
 						} else {
-							// 停止成功
+							a.logs.AddLog("已停止 HTTP 服务")
 							modal.SetText("已停止 HTTP 服务")
 						}
 
-						// 更改菜单项名称
 						a.updateMenuItemsState()
 
-						// 添加确认按钮
 						modal.AddButtons([]string{"OK"})
 						modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-							a.mainPages.RemovePage("modal")
+							a.rootPages.RemovePage("modal")
 						})
 						a.SetFocus(modal)
 					})
@@ -420,78 +475,60 @@ func (a *App) initMenu() {
 		Selected: func(i *menu.Item) {
 			modal := tview.NewModal()
 
-			// 根据当前自动解密状态执行不同操作
 			if !a.ctx.AutoDecrypt {
-				// 自动解密未开启，开启自动解密
+				a.logs.AddLog("开启自动解密...")
 				modal.SetText("正在开启自动解密...")
-				a.mainPages.AddPage("modal", modal, true, true)
+				a.rootPages.AddPage("modal", modal, true, true)
 				a.SetFocus(modal)
 
-				// 在后台开启自动解密
 				go func() {
 					err := a.m.StartAutoDecrypt()
 
-					// 在主线程中更新UI
 					a.QueueUpdateDraw(func() {
 						if err != nil {
-							// 开启失败
+							a.logs.AddLog("开启自动解密失败: " + err.Error())
 							modal.SetText("开启自动解密失败: " + err.Error())
 						} else {
-							// 开启成功
+							a.logs.AddLog("已开启自动解密")
 							modal.SetText("已开启自动解密")
 						}
 
-						// 更改菜单项名称
 						a.updateMenuItemsState()
-
-						// 添加确认按钮
 						modal.AddButtons([]string{"OK"})
 						modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-							a.mainPages.RemovePage("modal")
+							a.rootPages.RemovePage("modal")
 						})
 						a.SetFocus(modal)
 					})
 				}()
 			} else {
-				// 自动解密已开启，停止自动解密
+				a.logs.AddLog("停止自动解密...")
 				modal.SetText("正在停止自动解密...")
-				a.mainPages.AddPage("modal", modal, true, true)
+				a.rootPages.AddPage("modal", modal, true, true)
 				a.SetFocus(modal)
 
-				// 在后台停止自动解密
 				go func() {
 					err := a.m.StopAutoDecrypt()
 
-					// 在主线程中更新UI
 					a.QueueUpdateDraw(func() {
 						if err != nil {
-							// 停止失败
+							a.logs.AddLog("停止自动解密失败: " + err.Error())
 							modal.SetText("停止自动解密失败: " + err.Error())
 						} else {
-							// 停止成功
+							a.logs.AddLog("已停止自动解密")
 							modal.SetText("已停止自动解密")
 						}
 
-						// 更改菜单项名称
 						a.updateMenuItemsState()
-
-						// 添加确认按钮
 						modal.AddButtons([]string{"OK"})
 						modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-							a.mainPages.RemovePage("modal")
+							a.rootPages.RemovePage("modal")
 						})
 						a.SetFocus(modal)
 					})
 				}()
 			}
 		},
-	}
-
-	setting := &menu.Item{
-		Index:       7,
-		Name:        "设置",
-		Description: "设置应用程序选项",
-		Selected:    a.settingSelected,
 	}
 
 	selectAccount := &menu.Item{
@@ -541,23 +578,22 @@ func (a *App) initMenu() {
 				SetText(text).
 				AddButtons([]string{"返回"}).
 				SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-					a.mainPages.RemovePage("modal")
+					a.rootPages.RemovePage("modal")
 				})
-			a.mainPages.AddPage("modal", modal, true, true)
+			a.rootPages.AddPage("modal", modal, true, true)
 			a.SetFocus(modal)
 		},
 	}
 
-	a.menu.AddItem(getDataKey)
-	a.menu.AddItem(restartAndGetDataKey)
-	a.menu.AddItem(decryptData)
-	a.menu.AddItem(httpServer)
-	a.menu.AddItem(autoDecrypt)
-	a.menu.AddItem(setting)
-	a.menu.AddItem(selectAccount)
-	a.menu.AddItem(mcpSubscriptions)
+	a.actionsMenu.AddItem(getDataKey)
+	a.actionsMenu.AddItem(restartAndGetDataKey)
+	a.actionsMenu.AddItem(decryptData)
+	a.actionsMenu.AddItem(httpServer)
+	a.actionsMenu.AddItem(autoDecrypt)
+	a.actionsMenu.AddItem(selectAccount)
+	a.actionsMenu.AddItem(mcpSubscriptions)
 
-	a.menu.AddItem(&menu.Item{
+	a.actionsMenu.AddItem(&menu.Item{
 		Index:       10,
 		Name:        "退出",
 		Description: "退出程序",
@@ -567,150 +603,85 @@ func (a *App) initMenu() {
 	})
 }
 
-// settingItem 表示一个设置项
+// settingItem represents a setting item
 type settingItem struct {
 	name        string
 	description string
 	action      func()
 }
 
-func (a *App) settingSelected(i *menu.Item) {
-
-	settings := []settingItem{
-		{
-			name:        "设置 HTTP 服务地址",
-			description: "配置 HTTP 服务监听的地址",
-			action:      a.settingHTTPPort,
-		},
-		{
-			name:        "设置工作目录",
-			description: "配置数据解密后的存储目录",
-			action:      a.settingWorkDir,
-		},
-		{
-			name:        "设置数据密钥",
-			description: "配置数据解密密钥",
-			action:      a.settingDataKey,
-		},
-		{
-			name:        "设置图片密钥",
-			description: "配置图片解密密钥",
-			action:      a.settingImgKey,
-		},
-		{
-			name:        "设置数据目录",
-			description: "配置微信数据文件所在目录",
-			action:      a.settingDataDir,
-		},
-	}
-
-	subMenu := menu.NewSubMenu("设置")
-	for idx, setting := range settings {
-		item := &menu.Item{
-			Index:       idx + 1,
-			Name:        setting.name,
-			Description: setting.description,
-			Selected: func(action func()) func(*menu.Item) {
-				return func(*menu.Item) {
-					action()
-				}
-			}(setting.action),
-		}
-		subMenu.AddItem(item)
-	}
-
-	a.mainPages.AddPage("submenu", subMenu, true, true)
-	a.SetFocus(subMenu)
-}
-
-// settingHTTPPort 设置 HTTP 端口
+// settingHTTPPort Sets HTTP Port
 func (a *App) settingHTTPPort() {
-	// 使用我们的自定义表单组件
 	formView := form.NewForm("设置 HTTP 地址")
-
-	// 临时存储用户输入的值
 	tempHTTPAddr := a.ctx.HTTPAddr
 
-	// 添加输入字段 - 不再直接设置HTTP地址，而是更新临时变量
 	formView.AddInputField("地址", tempHTTPAddr, 0, nil, func(text string) {
-		tempHTTPAddr = text // 只更新临时变量
+		tempHTTPAddr = text
 	})
 
-	// 添加按钮 - 点击保存时才设置HTTP地址
 	formView.AddButton("保存", func() {
-		a.m.SetHTTPAddr(tempHTTPAddr) // 在这里设置HTTP地址
-		a.mainPages.RemovePage("submenu2")
+		a.m.SetHTTPAddr(tempHTTPAddr)
+		a.rootPages.RemovePage("form")
 		a.showInfo("HTTP 地址已设置为 " + a.ctx.HTTPAddr)
 	})
 
 	formView.AddButton("取消", func() {
-		a.mainPages.RemovePage("submenu2")
+		a.rootPages.RemovePage("form")
 	})
 
-	a.mainPages.AddPage("submenu2", formView, true, true)
+	a.rootPages.AddPage("form", formView, true, true)
 	a.SetFocus(formView)
 }
 
-// settingWorkDir 设置工作目录
+// settingWorkDir Sets Work Dir
 func (a *App) settingWorkDir() {
-	// 使用我们的自定义表单组件
 	formView := form.NewForm("设置工作目录")
-
-	// 临时存储用户输入的值
 	tempWorkDir := a.ctx.WorkDir
 
-	// 添加输入字段 - 不再直接设置工作目录，而是更新临时变量
 	formView.AddInputField("工作目录", tempWorkDir, 0, nil, func(text string) {
-		tempWorkDir = text // 只更新临时变量
+		tempWorkDir = text
 	})
 
-	// 添加按钮 - 点击保存时才设置工作目录
 	formView.AddButton("保存", func() {
-		a.ctx.SetWorkDir(tempWorkDir) // 在这里设置工作目录
-		a.mainPages.RemovePage("submenu2")
+		a.ctx.SetWorkDir(tempWorkDir)
+		a.rootPages.RemovePage("form")
 		a.showInfo("工作目录已设置为 " + a.ctx.WorkDir)
 	})
 
 	formView.AddButton("取消", func() {
-		a.mainPages.RemovePage("submenu2")
+		a.rootPages.RemovePage("form")
 	})
 
-	a.mainPages.AddPage("submenu2", formView, true, true)
+	a.rootPages.AddPage("form", formView, true, true)
 	a.SetFocus(formView)
 }
 
-// settingDataKey 设置数据密钥
+// settingDataKey Sets Data Key
 func (a *App) settingDataKey() {
-	// 使用我们的自定义表单组件
 	formView := form.NewForm("设置数据密钥")
-
-	// 临时存储用户输入的值
 	tempDataKey := a.ctx.DataKey
 
-	// 添加输入字段 - 不直接设置数据密钥，而是更新临时变量
 	formView.AddInputField("数据密钥", tempDataKey, 0, nil, func(text string) {
-		tempDataKey = text // 只更新临时变量
+		tempDataKey = text
 	})
 
-	// 添加按钮 - 点击保存时才设置数据密钥
 	formView.AddButton("保存", func() {
-		a.ctx.DataKey = tempDataKey // 设置数据密钥
-		a.mainPages.RemovePage("submenu2")
+		a.ctx.DataKey = tempDataKey
+		a.rootPages.RemovePage("form")
 		a.showInfo("数据密钥已设置")
 	})
 
 	formView.AddButton("取消", func() {
-		a.mainPages.RemovePage("submenu2")
+		a.rootPages.RemovePage("form")
 	})
 
-	a.mainPages.AddPage("submenu2", formView, true, true)
+	a.rootPages.AddPage("form", formView, true, true)
 	a.SetFocus(formView)
 }
 
-// settingImgKey 设置图片密钥 (ImgKey)
+// settingImgKey Sets Image Key
 func (a *App) settingImgKey() {
 	formView := form.NewForm("设置图片密钥")
-
 	tempImgKey := a.ctx.ImgKey
 
 	formView.AddInputField("图片密钥", tempImgKey, 0, nil, func(text string) {
@@ -719,75 +690,58 @@ func (a *App) settingImgKey() {
 
 	formView.AddButton("保存", func() {
 		a.ctx.SetImgKey(tempImgKey)
-		a.mainPages.RemovePage("submenu2")
+		a.rootPages.RemovePage("form")
 		a.showInfo("图片密钥已设置")
 	})
 
 	formView.AddButton("取消", func() {
-		a.mainPages.RemovePage("submenu2")
+		a.rootPages.RemovePage("form")
 	})
 
-	a.mainPages.AddPage("submenu2", formView, true, true)
+	a.rootPages.AddPage("form", formView, true, true)
 	a.SetFocus(formView)
 }
 
-// settingDataDir 设置数据目录
+// settingDataDir Sets Data Dir
 func (a *App) settingDataDir() {
-	// 使用我们的自定义表单组件
 	formView := form.NewForm("设置数据目录")
-
-	// 临时存储用户输入的值
 	tempDataDir := a.ctx.DataDir
 
-	// 添加输入字段 - 不直接设置数据目录，而是更新临时变量
 	formView.AddInputField("数据目录", tempDataDir, 0, nil, func(text string) {
-		tempDataDir = text // 只更新临时变量
+		tempDataDir = text
 	})
 
-	// 添加按钮 - 点击保存时才设置数据目录
 	formView.AddButton("保存", func() {
-		a.ctx.DataDir = tempDataDir // 设置数据目录
-		a.mainPages.RemovePage("submenu2")
+		a.ctx.DataDir = tempDataDir
+		a.rootPages.RemovePage("form")
 		a.showInfo("数据目录已设置为 " + a.ctx.DataDir)
 	})
 
 	formView.AddButton("取消", func() {
-		a.mainPages.RemovePage("submenu2")
+		a.rootPages.RemovePage("form")
 	})
 
-	a.mainPages.AddPage("submenu2", formView, true, true)
+	a.rootPages.AddPage("form", formView, true, true)
 	a.SetFocus(formView)
 }
 
-// selectAccountSelected 处理切换账号菜单项的选择事件
+// selectAccountSelected Handles account switch selection
 func (a *App) selectAccountSelected(i *menu.Item) {
-	// 创建子菜单
+	// Create sub-menu for account selection
 	subMenu := menu.NewSubMenu("切换账号")
 
-	// 添加微信进程
+	// Add instances
 	instances := a.m.wechat.GetWeChatInstances()
 	if len(instances) > 0 {
-		// 添加实例标题
-		subMenu.AddItem(&menu.Item{
-			Index:       0,
-			Name:        "--- 微信进程 ---",
-			Description: "",
-			Hidden:      false,
-			Selected:    nil,
-		})
+		subMenu.AddItem(&menu.Item{Index: 0, Name: "--- 微信进程 ---", Description: "", Hidden: false, Selected: nil})
 
-		// 添加实例列表
 		for idx, instance := range instances {
-			// 创建一个实例描述
 			description := fmt.Sprintf("版本: %s 目录: %s", instance.FullVersion, instance.DataDir)
-
-			// 标记当前选中的实例
 			name := fmt.Sprintf("%s [%d]", instance.Name, instance.PID)
 			if a.ctx.Current != nil && a.ctx.Current.PID == instance.PID {
 				name = name + " [当前]"
 			}
 
-			// 创建菜单项
 			instanceItem := &menu.Item{
 				Index:       idx + 1,
 				Name:        name,
@@ -795,34 +749,25 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 				Hidden:      false,
 				Selected: func(instance *wechat.Account) func(*menu.Item) {
 					return func(*menu.Item) {
-						// 如果是当前账号，则无需切换
 						if a.ctx.Current != nil && a.ctx.Current.PID == instance.PID {
-							a.mainPages.RemovePage("submenu")
+							a.rootPages.RemovePage("submenu")
 							a.showInfo("已经是当前账号")
 							return
 						}
 
-						// 显示切换中的模态框
 						modal := tview.NewModal().SetText("正在切换账号...")
-						a.mainPages.AddPage("modal", modal, true, true)
+						a.rootPages.AddPage("modal", modal, true, true)
 						a.SetFocus(modal)
 
-						// 在后台执行切换操作
 						go func() {
 							err := a.m.Switch(instance, "")
-
-							// 在主线程中更新UI
 							a.QueueUpdateDraw(func() {
-								a.mainPages.RemovePage("modal")
-								a.mainPages.RemovePage("submenu")
-
+								a.rootPages.RemovePage("modal")
+								a.rootPages.RemovePage("submenu")
 								if err != nil {
-									// 切换失败
 									a.showError(fmt.Errorf("切换账号失败: %v", err))
 								} else {
-									// 切换成功
 									a.showInfo("切换账号成功")
-									// 更新菜单状态
 									a.updateMenuItemsState()
 								}
 							})
@@ -834,24 +779,12 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 		}
 	}
 
-	// 添加历史账号
+	// Add History
 	if len(a.ctx.History) > 0 {
-		// 添加历史账号标题
-		subMenu.AddItem(&menu.Item{
-			Index:       100,
-			Name:        "--- 历史账号 ---",
-			Description: "",
-			Hidden:      false,
-			Selected:    nil,
-		})
-
-		// 添加历史账号列表
+		subMenu.AddItem(&menu.Item{Index: 100, Name: "--- 历史账号 ---", Description: "", Hidden: false, Selected: nil})
 		idx := 101
 		for account, hist := range a.ctx.History {
-			// 创建一个账号描述
 			description := fmt.Sprintf("版本: %s 目录: %s", hist.FullVersion, hist.DataDir)
-
-			// 标记当前选中的账号
 			name := account
 			if name == "" {
 				name = filepath.Base(hist.DataDir)
@@ -860,7 +793,6 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 				name = name + " [当前]"
 			}
 
-			// 创建菜单项
 			histItem := &menu.Item{
 				Index:       idx,
 				Name:        name,
@@ -868,34 +800,25 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 				Hidden:      false,
 				Selected: func(account string) func(*menu.Item) {
 					return func(*menu.Item) {
-						// 如果是当前账号，则无需切换
 						if a.ctx.Current != nil && a.ctx.DataDir == a.ctx.History[account].DataDir {
-							a.mainPages.RemovePage("submenu")
+							a.rootPages.RemovePage("submenu")
 							a.showInfo("已经是当前账号")
 							return
 						}
 
-						// 显示切换中的模态框
 						modal := tview.NewModal().SetText("正在切换账号...")
-						a.mainPages.AddPage("modal", modal, true, true)
+						a.rootPages.AddPage("modal", modal, true, true)
 						a.SetFocus(modal)
 
-						// 在后台执行切换操作
 						go func() {
 							err := a.m.Switch(nil, account)
-
-							// 在主线程中更新UI
 							a.QueueUpdateDraw(func() {
-								a.mainPages.RemovePage("modal")
-								a.mainPages.RemovePage("submenu")
-
+								a.rootPages.RemovePage("modal")
+								a.rootPages.RemovePage("submenu")
 								if err != nil {
-									// 切换失败
 									a.showError(fmt.Errorf("切换账号失败: %v", err))
 								} else {
-									// 切换成功
 									a.showInfo("切换账号成功")
-									// 更新菜单状态
 									a.updateMenuItemsState()
 								}
 							})
@@ -908,43 +831,35 @@ func (a *App) selectAccountSelected(i *menu.Item) {
 		}
 	}
 
-	// 如果没有账号可选择
 	if len(a.ctx.History) == 0 && len(instances) == 0 {
-		subMenu.AddItem(&menu.Item{
-			Index:       1,
-			Name:        "无可用账号",
-			Description: "未检测到微信进程或历史账号",
-			Hidden:      false,
-			Selected:    nil,
-		})
+		subMenu.AddItem(&menu.Item{Index: 1, Name: "无可用账号", Description: "未检测到微信进程或历史账号", Hidden: false, Selected: nil})
 	}
 
-	// 显示子菜单
-	a.mainPages.AddPage("submenu", subMenu, true, true)
+	a.rootPages.AddPage("submenu", subMenu, true, true)
 	a.SetFocus(subMenu)
 }
 
-// showModal 显示一个模态对话框
+// showModal Shows a modal
 func (a *App) showModal(text string, buttons []string, doneFunc func(buttonIndex int, buttonLabel string)) {
 	modal := tview.NewModal().
 		SetText(text).
 		AddButtons(buttons).
 		SetDoneFunc(doneFunc)
 
-	a.mainPages.AddPage("modal", modal, true, true)
+	a.rootPages.AddPage("modal", modal, true, true)
 	a.SetFocus(modal)
 }
 
-// showError 显示错误对话框
+// showError Shows an error modal
 func (a *App) showError(err error) {
 	a.showModal(err.Error(), []string{"OK"}, func(buttonIndex int, buttonLabel string) {
-		a.mainPages.RemovePage("modal")
+		a.rootPages.RemovePage("modal")
 	})
 }
 
-// showInfo 显示信息对话框
+// showInfo Shows an info modal
 func (a *App) showInfo(text string) {
 	a.showModal(text, []string{"OK"}, func(buttonIndex int, buttonLabel string) {
-		a.mainPages.RemovePage("modal")
+		a.rootPages.RemovePage("modal")
 	})
 }
