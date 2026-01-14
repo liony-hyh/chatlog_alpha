@@ -63,6 +63,7 @@ func (s *Service) initAPIRouter() {
 		api.GET("/contact", s.handleContacts)
 		api.GET("/chatroom", s.handleChatRooms)
 		api.GET("/session", s.handleSessions)
+		api.GET("/sns", s.handleSNS)
 		api.GET("/db", s.handleGetDBs)
 		api.GET("/db/tables", s.handleGetDBTables)
 		api.GET("/db/data", s.handleGetDBTableData)
@@ -1067,6 +1068,192 @@ func (s *Service) exportData(c *gin.Context, data []map[string]interface{}, form
 		if err := f.Write(c.Writer); err != nil {
 			log.Error().Err(err).Msg("Failed to write excel file")
 		}
+	}
+}
+
+func (s *Service) handleSNS(c *gin.Context) {
+	q := struct {
+		Username string `form:"username"`
+		Limit    int    `form:"limit"`
+		Offset   int    `form:"offset"`
+		Format   string `form:"format"`
+	}{}
+
+	if err := c.BindQuery(&q); err != nil {
+		errors.Err(c, err)
+		return
+	}
+
+	if q.Limit < 0 {
+		q.Limit = 0
+	}
+	if q.Offset < 0 {
+		q.Offset = 0
+	}
+
+	format := strings.ToLower(q.Format)
+
+	// 原始格式需要直接从数据库查询 XML
+	if format == "raw" {
+		s.handleSNSRaw(c, q.Username, q.Limit, q.Offset)
+		return
+	}
+
+	data, err := s.db.GetSNSTimeline(q.Username, q.Limit, q.Offset)
+	if err != nil {
+		errors.Err(c, err)
+		return
+	}
+
+	switch format {
+	case "csv", "xlsx", "excel":
+		s.exportData(c, data, format, "sns_timeline")
+	case "json":
+		c.JSON(http.StatusOK, data)
+	default:
+		c.Writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		c.Writer.Header().Set("Cache-Control", "no-cache")
+		c.Writer.Header().Set("Connection", "keep-alive")
+		c.Writer.Flush()
+
+		for _, item := range data {
+			// 格式化输出
+			if createTimeStr, ok := item["create_time_str"].(string); ok {
+				c.Writer.WriteString(fmt.Sprintf("📅 %s\n", createTimeStr))
+			}
+			if nickname, ok := item["nickname"].(string); ok && nickname != "" {
+				c.Writer.WriteString(fmt.Sprintf("👤 %s\n", nickname))
+			}
+			if contentDesc, ok := item["content_desc"].(string); ok && contentDesc != "" {
+				c.Writer.WriteString(fmt.Sprintf("💬 %s\n", contentDesc))
+			}
+			if location, ok := item["location"].(map[string]interface{}); ok {
+				c.Writer.WriteString("📍 ")
+				if poiName, ok := location["poi_name"].(string); ok && poiName != "" {
+					c.Writer.WriteString(poiName)
+					if poiAddress, ok := location["poi_address"].(string); ok && poiAddress != "" {
+						c.Writer.WriteString(fmt.Sprintf(" (%s)", poiAddress))
+					}
+				} else if city, ok := location["city"].(string); ok && city != "" {
+					c.Writer.WriteString(city)
+				}
+				c.Writer.WriteString("\n")
+			}
+			if contentType, ok := item["content_type"].(string); ok {
+				switch contentType {
+				case "image":
+					if mediaList, ok := item["media_list"].([]interface{}); ok {
+						c.Writer.WriteString(fmt.Sprintf("🖼️ 图片 (%d张)\n", len(mediaList)))
+					}
+				case "video":
+					if mediaList, ok := item["media_list"].([]interface{}); ok && len(mediaList) > 0 {
+						if media, ok := mediaList[0].(map[string]interface{}); ok {
+							if duration, ok := media["duration"].(string); ok && duration != "" {
+								c.Writer.WriteString(fmt.Sprintf("🎬 视频 (%s)\n", duration))
+							} else {
+								c.Writer.WriteString("🎬 视频\n")
+							}
+						}
+					}
+				case "article":
+					if article, ok := item["article"].(map[string]interface{}); ok {
+						if title, ok := article["title"].(string); ok {
+							c.Writer.WriteString(fmt.Sprintf("📰 文章: %s\n", title))
+						}
+						if url, ok := article["url"].(string); ok {
+							c.Writer.WriteString(fmt.Sprintf("   %s\n", url))
+						}
+					}
+				case "finder":
+					if feed, ok := item["finder_feed"].(map[string]interface{}); ok {
+						if nickname, ok := feed["nickname"].(string); ok {
+							c.Writer.WriteString(fmt.Sprintf("📺 视频号: %s\n", nickname))
+						}
+						if desc, ok := feed["desc"].(string); ok && desc != "" {
+							c.Writer.WriteString(fmt.Sprintf("   %s\n", desc))
+						}
+					}
+				}
+			}
+			c.Writer.WriteString(strings.Repeat("=", 80) + "\n\n")
+			c.Writer.Flush()
+		}
+	}
+}
+
+// handleSNSRaw 处理原始格式输出（返回原始 XML）
+func (s *Service) handleSNSRaw(c *gin.Context, username string, limit, offset int) {
+	// 获取 wechatdb.DB
+	db := s.db.GetDB()
+	if db == nil {
+		errors.Err(c, fmt.Errorf("database not available"))
+		return
+	}
+
+	// 获取数据库列表
+	dbs, err := db.GetDBs()
+	if err != nil {
+		errors.Err(c, err)
+		return
+	}
+
+	snsDBs, ok := dbs["sns"]
+	if !ok || len(snsDBs) == 0 {
+		errors.Err(c, fmt.Errorf("SNS database not found"))
+		return
+	}
+
+	// 使用第一个 sns 数据库文件
+	snsFile := snsDBs[0]
+
+	// 构建查询
+	query := "SELECT tid, user_name, content FROM SnsTimeLine"
+
+	if username != "" {
+		// 转义单引号以防止 SQL 注入
+		username = strings.ReplaceAll(username, "'", "''")
+		query += fmt.Sprintf(" WHERE user_name = '%s'", username)
+	}
+
+	query += " ORDER BY tid DESC"
+
+	// 执行查询（使用 ExecuteSQL）
+	result, err := db.ExecuteSQL("sns", snsFile, query)
+	if err != nil {
+		errors.Err(c, err)
+		return
+	}
+
+	// 手动处理分页（因为 ExecuteSQL 不支持 LIMIT/OFFSET）
+	if offset > 0 || limit > 0 {
+		if offset >= len(result) {
+			result = []map[string]interface{}{}
+		} else {
+			result = result[offset:]
+			if limit > 0 && limit < len(result) {
+				result = result[:limit]
+			}
+		}
+	}
+
+	c.Writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Flush()
+
+	for _, item := range result {
+		// 输出原始格式
+		if tid, ok := item["tid"]; ok {
+			c.Writer.WriteString(fmt.Sprintf("TID: %v\n", tid))
+		}
+		if userName, ok := item["user_name"]; ok {
+			c.Writer.WriteString(fmt.Sprintf("UserName: %v\n", userName))
+		}
+		if content, ok := item["content"]; ok {
+			c.Writer.WriteString(fmt.Sprintf("Content (XML):\n%v\n", content))
+		}
+		c.Writer.WriteString(strings.Repeat("-", 80) + "\n\n")
+		c.Writer.Flush()
 	}
 }
 

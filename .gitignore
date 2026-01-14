@@ -33,3 +33,9 @@ tmpclaude-2f08-cwd
 tmpclaude-7272-cwd
 tmpclaude-c3fe-cwd
 tmpclaude-d406-cwd
+
+# Claude Code temp directories
+tmpclaude-*/
+
+# Test files
+sns.md

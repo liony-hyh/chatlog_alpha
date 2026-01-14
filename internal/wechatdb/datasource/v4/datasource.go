@@ -27,6 +27,7 @@ const (
 	Session = "session"
 	Media   = "media"
 	Voice   = "voice"
+	SNS     = "sns"
 )
 
 var Groups = []*dbm.Group{
@@ -53,6 +54,11 @@ var Groups = []*dbm.Group{
 	{
 		Name:      Voice,
 		Pattern:   `^media_([0-9]?[0-9])?\.db$`,
+		BlackList: []string{},
+	},
+	{
+		Name:      SNS,
+		Pattern:   `^sns\.db$`,
 		BlackList: []string{},
 	},
 }
@@ -1017,4 +1023,120 @@ func (ds *DataSource) ExecuteSQL(group, file, query string) ([]map[string]interf
 
 func (ds *DataSource) Close() error {
 	return ds.dbm.Close()
+}
+
+// GetSNSTimeline 获取朋友圈时间线数据
+func (ds *DataSource) GetSNSTimeline(ctx context.Context, username string, limit, offset int) ([]map[string]interface{}, error) {
+	db, err := ds.dbm.GetDB(SNS)
+	if err != nil {
+		return nil, err
+	}
+
+	var query string
+	var args []interface{}
+
+	if username != "" {
+		query = `SELECT tid, user_name, content, pack_info_buf FROM SnsTimeLine WHERE user_name = ? ORDER BY tid DESC`
+		args = []interface{}{username}
+	} else {
+		query = `SELECT tid, user_name, content, pack_info_buf FROM SnsTimeLine ORDER BY tid DESC`
+	}
+
+	// 添加分页
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+		if offset > 0 {
+			query += fmt.Sprintf(" OFFSET %d", offset)
+		}
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, errors.QueryFailed(query, err)
+	}
+	defer rows.Close()
+
+	result := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var tid int64
+		var userName string
+		var content string
+		var packInfoBuf string
+
+		err := rows.Scan(&tid, &userName, &content, &packInfoBuf)
+		if err != nil {
+			return nil, errors.ScanRowFailed(err)
+		}
+
+		// 解析 XML 内容
+		parsedPost, err := model.ParseSNSContent(content)
+		if err != nil {
+			// 如果解析失败，返回原始数据
+			result = append(result, map[string]interface{}{
+				"tid":          tid,
+				"user_name":    userName,
+				"content":      content,
+				"pack_info_buf": packInfoBuf,
+				"parse_error":  err.Error(),
+			})
+			continue
+		}
+
+		// 转换为 map[string]interface{}
+		postMap := map[string]interface{}{
+			"tid":            tid,
+			"user_name":      userName,
+			"nickname":       parsedPost.NickName,
+			"create_time":    parsedPost.CreateTime,
+			"create_time_str": parsedPost.CreateTimeStr,
+			"content_desc":   parsedPost.ContentDesc,
+			"content_type":   parsedPost.ContentType,
+		}
+
+		if parsedPost.Location != nil {
+			postMap["location"] = parsedPost.Location
+		}
+
+		if len(parsedPost.MediaList) > 0 {
+			postMap["media_list"] = parsedPost.MediaList
+		}
+
+		if parsedPost.Article != nil {
+			postMap["article"] = parsedPost.Article
+		}
+
+		if parsedPost.FinderFeed != nil {
+			postMap["finder_feed"] = parsedPost.FinderFeed
+		}
+
+		result = append(result, postMap)
+	}
+
+	return result, nil
+}
+
+// GetSNSCount 统计朋友圈数量
+func (ds *DataSource) GetSNSCount(ctx context.Context, username string) (int, error) {
+	db, err := ds.dbm.GetDB(SNS)
+	if err != nil {
+		return 0, err
+	}
+
+	var query string
+	var args []interface{}
+
+	if username != "" {
+		query = `SELECT COUNT(*) FROM SnsTimeLine WHERE user_name = ?`
+		args = []interface{}{username}
+	} else {
+		query = `SELECT COUNT(*) FROM SnsTimeLine`
+	}
+
+	var count int
+	err = db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, errors.QueryFailed(query, err)
+	}
+
+	return count, nil
 }

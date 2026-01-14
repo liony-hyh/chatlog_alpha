@@ -157,3 +157,13 @@ func (w *DB) GetTableData(group, file, table string, limit, offset int, keyword 
 func (w *DB) ExecuteSQL(group, file, query string) ([]map[string]interface{}, error) {
 	return w.ds.ExecuteSQL(group, file, query)
 }
+
+// GetSNSTimeline 获取朋友圈时间线数据
+func (w *DB) GetSNSTimeline(username string, limit, offset int) ([]map[string]interface{}, error) {
+	return w.ds.GetSNSTimeline(context.Background(), username, limit, offset)
+}
+
+// GetSNSCount 获取朋友圈数量统计
+func (w *DB) GetSNSCount(username string) (int, error) {
+	return w.ds.GetSNSCount(context.Background(), username)
+}
